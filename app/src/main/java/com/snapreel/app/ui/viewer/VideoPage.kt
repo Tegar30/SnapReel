@@ -6,6 +6,8 @@ import androidx.annotation.OptIn
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -20,6 +22,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.testTag
@@ -82,6 +85,20 @@ fun VideoPage(
     val currentOnTap by rememberUpdatedState(onTap)
     val currentOnDoubleTapLeft by rememberUpdatedState(onDoubleTapLeft)
     val currentOnDoubleTapRight by rememberUpdatedState(onDoubleTapRight)
+
+    // Pinch-to-zoom state
+    var scale by remember { mutableFloatStateOf(1f) }
+    var offsetX by remember { mutableFloatStateOf(0f) }
+    var offsetY by remember { mutableFloatStateOf(0f) }
+
+    // Reset zoom when leaving page
+    LaunchedEffect(isCurrentPage) {
+        if (!isCurrentPage) {
+            scale = 1f
+            offsetX = 0f
+            offsetY = 0f
+        }
+    }
 
     val showSeekLeft = remember { mutableStateOf(false) }
     val showSeekRight = remember { mutableStateOf(false) }
@@ -155,17 +172,48 @@ fun VideoPage(
                         currentOnTap()
                     },
                     onDoubleTap = { offset ->
-                        val tapX = offset.x
-                        val screenWidthPx = screenWidth * density
-                        if (tapX < screenWidthPx / 2) {
-                            showSeekLeft.value = true
-                            currentOnDoubleTapLeft()
+                        if (scale > 1.05f) {
+                            // If zoomed in, double-tap resets zoom back to 1x
+                            scale = 1f
+                            offsetX = 0f
+                            offsetY = 0f
                         } else {
-                            showSeekRight.value = true
-                            currentOnDoubleTapRight()
+                            val tapX = offset.x
+                            val screenWidthPx = screenWidth * density
+                            if (tapX < screenWidthPx / 2) {
+                                showSeekLeft.value = true
+                                currentOnDoubleTapLeft()
+                            } else {
+                                showSeekRight.value = true
+                                currentOnDoubleTapRight()
+                            }
                         }
                     }
                 )
+            }
+            // Pinch-to-zoom gesture (separate pointerInput so they don't conflict)
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        // Only process multi-finger gestures for zoom/pan
+                        if (event.changes.size > 1) {
+                            val zoom = event.calculateZoom()
+                            val pan = event.calculatePan()
+
+                            scale = (scale * zoom).coerceIn(1f, 5f)
+
+                            if (scale > 1f) {
+                                offsetX += pan.x
+                                offsetY += pan.y
+                            } else {
+                                offsetX = 0f
+                                offsetY = 0f
+                            }
+                            event.changes.forEach { it.consume() }
+                        }
+                    }
+                }
             }
     ) {
         // 1. Frosted Blurred Backdrop for Landscape/Fitted Videos
@@ -186,9 +234,19 @@ fun VideoPage(
             )
         }
 
-        // 2. Hardware-Accelerated Video Player: every composed video page has its own view,
-        // bound to its pooled player, so a prepared neighbor already shows its first frame.
-        run {
+        // 2 & 3. Video Player and Instant Preview with Zoom/Pan Transformation
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                    translationX = offsetX
+                    translationY = offsetY
+                }
+        ) {
+            // Hardware-Accelerated Video Player: every composed video page has its own view,
+            // bound to its pooled player, so a prepared neighbor already shows its first frame.
             AndroidView(
                 factory = { context ->
                     PlayerView(context).apply {
@@ -216,26 +274,26 @@ fun VideoPage(
                 },
                 modifier = Modifier.fillMaxSize()
             )
-        }
 
-        // 3. Instant Preview Thumbnail (Zero Black Screen: Stays visible until ExoPlayer renders first frame)
-        AnimatedVisibility(
-            visible = !isFirstFrameRendered,
-            enter = fadeIn(tween(0)),
-            exit = fadeOut(tween(200))
-        ) {
-            coil3.compose.AsyncImage(
-                model = previewRequest,
-                contentDescription = mediaItem.name,
-                contentScale = if (shouldZoom) androidx.compose.ui.layout.ContentScale.Crop else androidx.compose.ui.layout.ContentScale.Fit,
-                onSuccess = { state ->
-                    val size = state.painter.intrinsicSize
-                    if (size.width > 0f && size.height > 0f) previewLandscape = size.width > size.height
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .testTag(VideoPageTags.PREVIEW)
-            )
+            // Instant Preview Thumbnail (Zero Black Screen: Stays visible until ExoPlayer renders first frame)
+            AnimatedVisibility(
+                visible = !isFirstFrameRendered,
+                enter = fadeIn(tween(0)),
+                exit = fadeOut(tween(200))
+            ) {
+                coil3.compose.AsyncImage(
+                    model = previewRequest,
+                    contentDescription = mediaItem.name,
+                    contentScale = if (shouldZoom) androidx.compose.ui.layout.ContentScale.Crop else androidx.compose.ui.layout.ContentScale.Fit,
+                    onSuccess = { state ->
+                        val size = state.painter.intrinsicSize
+                        if (size.width > 0f && size.height > 0f) previewLandscape = size.width > size.height
+                    },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .testTag(VideoPageTags.PREVIEW)
+                )
+            }
         }
 
         // Failure overlay: message + Retry. Swipes pass through to the pager.
